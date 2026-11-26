@@ -83,12 +83,13 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
 /// know: Windows 10's in-box runtime refuses the directly indexed heap
 /// flags, #168). The title then has a failure and no blob, which its code
 /// may not check, so the refusal is logged with the host's reason.
-fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) {
+fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) -> Option<String> {
     if hr >= 0 {
-        return;
+        return None;
     }
-    // SAFETY: `error` is the title's out pointer, nulled before the host's
-    // call; the host put its blob there or left it null.
+    // SAFETY: `error` is the title's out pointer or ours ([`forward`]),
+    // nulled before the host's call; the host put its blob there or left it
+    // null.
     let blob = (!error.is_null())
         .then(|| unsafe { *error })
         .filter(|b| !b.is_null());
@@ -107,6 +108,36 @@ fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) {
         why = why.as_deref().unwrap_or(""),
         "host refused the title's root signature"
     );
+    why
+}
+
+/// `call` (the host's serializer) with the title's error out pointer, or
+/// with one of ours when the title passed none, so that a refusal is still
+/// logged with the host's reason; a blob put in ours is released here, one
+/// put in the title's is the title's.
+fn forward(
+    flags: u32,
+    error: *mut *mut c_void,
+    call: impl FnOnce(*mut *mut c_void) -> HRESULT,
+) -> (HRESULT, Option<String>) {
+    let mut local: *mut c_void = std::ptr::null_mut();
+    let out = if error.is_null() {
+        &raw mut local
+    } else {
+        clear(error);
+        error
+    };
+    let hr = call(out);
+    let why = note_refusal(hr, flags, out);
+    if !local.is_null() {
+        #[cfg(windows)]
+        {
+            use windows::core::Interface;
+            // SAFETY: the host's blob in our out pointer: ours to release.
+            drop(unsafe { windows::Win32::Graphics::Direct3D::ID3DBlob::from_raw(local) });
+        }
+    }
+    (hr, why)
 }
 
 /// Nulls the title's error out pointer, so a refusal's blob is the host's.
@@ -147,12 +178,12 @@ pub extern "system" fn serialize(
         return E_NOTIMPL;
     };
     let desc = without_console_flags(desc);
-    clear(error);
-    // SAFETY: the export has this signature; it takes what the title passed.
-    let hr =
-        unsafe { std::mem::transmute::<usize, Serialize>(address)(&desc, version, blob, error) };
-    note_refusal(hr, desc.flags, error);
-    hr
+    forward(desc.flags, error, |error| {
+        // SAFETY: the export has this signature; it takes what the title
+        // passed, and an error out pointer.
+        unsafe { std::mem::transmute::<usize, Serialize>(address)(&desc, version, blob, error) }
+    })
+    .0
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -174,12 +205,12 @@ pub extern "system" fn serialize_versioned(
         desc: without_console_flags(desc.desc),
         ..desc
     };
-    clear(error);
-    // SAFETY: the export has this signature; it takes what the title passed.
-    let hr =
-        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
-    note_refusal(hr, desc.desc.flags, error);
-    hr
+    forward(desc.desc.flags, error, |error| {
+        // SAFETY: the export has this signature; it takes what the title
+        // passed, and an error out pointer.
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    })
+    .0
 }
 
 type Deserialize =
@@ -587,6 +618,44 @@ mod tests {
             "{text}"
         );
         slot::<extern "system" fn(This) -> u32>(error, 0x10)(error);
+    }
+
+    /// A title that passes no error out pointer still gets the refusal
+    /// logged with the host's reason (from an out pointer of ours).
+    #[cfg(windows)]
+    #[test]
+    fn a_refusal_without_an_error_pointer_keeps_the_hosts_reason() {
+        use crate::object::E_INVALIDARG;
+        let desc = VersionedDesc {
+            version: 2,
+            desc: Desc {
+                parameter_count: 0,
+                parameters: std::ptr::null(),
+                sampler_count: 0,
+                samplers: std::ptr::null(),
+                flags: 0x0080_0001,
+            },
+        };
+        static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
+        let address = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature").unwrap();
+        let mut blob = std::ptr::null_mut();
+        let (hr, why) = forward(desc.desc.flags, std::ptr::null_mut(), |error| {
+            // SAFETY: the host export, a description, and out pointers.
+            unsafe {
+                std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, &mut blob, error)
+            }
+        });
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(blob.is_null());
+        let why = why.unwrap_or_default();
+        assert!(
+            why.contains("Unsupported bit-flag set (root signature flags 800001)"),
+            "{why}"
+        );
+        assert_eq!(
+            serialize_versioned(&desc, &mut blob, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 
     /// Version 1.0 through the versioned entry point, with a console flag.
