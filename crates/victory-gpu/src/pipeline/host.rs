@@ -1245,8 +1245,6 @@ mod tests {
         let flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | DIRECTLY_INDEXED;
         if sm66 {
             assert_eq!(runtime_refuses(flags), None);
-        }
-        if sm66 {
             assert!(root_signature(&host.device, &[], &[], false).is_ok());
             assert!(root_signature(&host.device, &[], &[], true).is_ok());
         }

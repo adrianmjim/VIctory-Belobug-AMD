@@ -102,12 +102,25 @@ fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) -> Option<Stri
     });
     #[cfg(not(windows))]
     let why = blob.map(|_| String::new());
-    tracing::warn!(
-        hr = format_args!("{hr:#x}"),
-        flags = format_args!("{flags:#x}"),
-        why = why.as_deref().unwrap_or(""),
-        "host refused the title's root signature"
-    );
+    // Once per distinct flags at warn (Windows 10's in-box runtime refuses
+    // every one with the 6.6 flags, which the device-level error explains);
+    // repeats at debug.
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !seen.contains(&flags);
+        if first {
+            seen.push(flags);
+        }
+        first
+    };
+    let (hr, flags) = (format!("{hr:#x}"), format!("{flags:#x}"));
+    let why_text = why.as_deref().unwrap_or("");
+    if first {
+        tracing::warn!(%hr, %flags, why = why_text, "host refused the title's root signature");
+    } else {
+        tracing::debug!(%hr, %flags, why = why_text, "host refused the title's root signature again");
+    }
     why
 }
 
