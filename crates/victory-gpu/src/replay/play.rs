@@ -36,7 +36,8 @@ pub mod pixel;
 mod upcopies;
 
 /// The name of the argument clamp's pipeline, by which its passes are
-/// recognised.
+/// recognised; the batched clamp's too (`edit::find_clamps` tells them
+/// apart).
 pub const CLAMP: &str = "victory: argument clamp";
 /// The name of the pipeline that compares and hashes card buffers.
 pub const COMPARE: &str = "victory: card compare";
@@ -328,6 +329,16 @@ fn median(v: &[f64]) -> f64 {
     let mut v = v.to_vec();
     v.sort_by(f64::total_cmp);
     v.get(v.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// The note of a switch that edits clamp passes, of the `n` it found to be
+/// batches already (`edit::find_clamps`): none for none.
+fn left_batched(switch: &str, n: u32) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "{switch}: {n} clamp passes of the capture are batches already (not recorded with VICTORY_INDIRECT_BATCH=0) and stay as they are"
+        )
+    })
 }
 
 /// The folder of a capture: `folder`, or the last `capture-<n>` in it that
@@ -2095,6 +2106,7 @@ impl Player {
                     batched.clamps += done.clamps;
                     batched.batches += done.batches;
                     batched.jobs += done.jobs;
+                    batched.left += done.left;
                     if done.scratch > 0 {
                         scratches.push((scratch, done.scratch));
                     }
@@ -2125,6 +2137,9 @@ impl Player {
                 "--batch-clamps: {} clamp passes became {}, of {} records",
                 batched.clamps, batched.batches, batched.jobs
             ));
+            report
+                .notes
+                .extend(left_batched("--batch-clamps", batched.left));
             if let Err(e) = self.make_batches(&jobs, &scratches) {
                 report.notes.push(format!("--batch-clamps failed: {e:#}"));
             }
@@ -2195,13 +2210,15 @@ impl Player {
     fn clamp_results(&mut self, report: &mut Report) -> Result<Vec<Vec<Clamp>>> {
         let psos = self.pipelines_named(CLAMP);
         let mut next = 0;
+        let mut batches = 0;
         let mut clamps = Vec::new();
         let mut submits = Vec::new();
         for s in &self.frame.submits {
             let mut lists = Vec::new();
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
                 let cmds = self.commands[l as usize].clone();
-                let found = edit::find_clamps(&cmds, &psos, &mut next);
+                let (found, left) = edit::find_clamps(&cmds, &psos, &mut next);
+                batches += left;
                 lists.push(edit::keep_clamped(cmds, &found)?);
                 clamps.push(found);
             }
@@ -2212,6 +2229,7 @@ impl Player {
             "--skip-clamps: {n} clamp passes, {} KB of arguments kept from a first run",
             next >> 10
         ));
+        report.notes.extend(left_batched("--skip-clamps", batches));
         if n == 0 {
             return Ok(clamps);
         }
@@ -3563,6 +3581,11 @@ mod tests {
     fn reports() {
         assert_eq!(median(&[]), 0.0);
         assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(left_batched("--skip-clamps", 0), None);
+        assert_eq!(
+            left_batched("--skip-clamps", 118).unwrap(),
+            "--skip-clamps: 118 clamp passes of the capture are batches already (not recorded with VICTORY_INDIRECT_BATCH=0) and stay as they are"
+        );
         let r = Report {
             frame_ms: vec![10.0, 12.0, 11.0],
             busy_ms: vec![9.0; 3],

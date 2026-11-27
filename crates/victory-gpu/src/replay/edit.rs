@@ -163,6 +163,8 @@ fn join(have: &mut Vec<Barrier>, b: Barrier) {
 pub struct Clamp {
     /// The command that dispatches it.
     pub at: usize,
+    /// Its pipeline.
+    pub pso: u32,
     /// The scratch buffer it writes the arguments to, from its start.
     pub scratch: u32,
     pub bytes: u64,
@@ -171,13 +173,26 @@ pub struct Clamp {
 }
 
 /// The clamp passes of a list (`psos`: the clamp's pipelines), given places
-/// in the results from `next` on.
-pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Clamp> {
-    let (mut bound, mut constants, mut to) = (NONE, [0u32; 6], None);
+/// in the results from `next` on; and how many passes of those pipelines
+/// are batches already (`crate::indirect::batch`: the host's way unless the
+/// capture was recorded with `VICTORY_INDIRECT_BATCH=0`). The host names
+/// both pipelines alike, and a batch has other parameters: it is none of
+/// the clamps found.
+pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> (Vec<Clamp>, u32) {
+    let (mut bound, mut constants, mut to, mut batch) = (NONE, [0u32; 6], None, false);
     let mut found = Vec::new();
+    let mut batches = 0;
     for (at, c) in cmds.iter().enumerate() {
         match c {
-            Cmd::Pipeline { pso } => bound = *pso,
+            // A pass sets its views after its root signature and pipeline:
+            // those of the pass before are not its own.
+            Cmd::RootSignature {
+                graphics: false, ..
+            } => (to, batch) = (None, false),
+            Cmd::Pipeline { pso } => {
+                bound = *pso;
+                (to, batch) = (None, false);
+            }
             Cmd::Constants {
                 graphics: false,
                 param: 0,
@@ -198,11 +213,22 @@ pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Cla
                 va: Va::At { res, offset: 0 },
                 ..
             } => to = Some(*res),
+            // The batch's parameters: four sources, the jobs, then the
+            // arguments and the budget it writes. The clamp has none past
+            // the fifth.
+            Cmd::RootView {
+                graphics: false,
+                param: 5 | 6,
+                ..
+            } => batch = true,
             Cmd::Dispatch { .. } if psos.contains(&bound) => {
-                if let Some(scratch) = to {
+                if batch {
+                    batches += 1;
+                } else if let Some(scratch) = to {
                     let bytes = u64::from(constants[1]) * u64::from(constants[2]);
                     found.push(Clamp {
                         at,
+                        pso: bound,
                         scratch,
                         bytes,
                         result: *next,
@@ -213,7 +239,7 @@ pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Cla
             _ => {}
         }
     }
-    found
+    (found, batches)
 }
 
 /// The list with a copy of what each clamp wrote into the results.
@@ -337,6 +363,8 @@ pub struct Batched {
     pub clamps: u32,
     pub batches: u32,
     pub jobs: u32,
+    /// Passes that were batches already, left as they are.
+    pub left: u32,
     /// The bytes of the scratch buffer.
     pub scratch: u64,
 }
@@ -359,7 +387,8 @@ struct Batch {
 /// dispatches since the batch before it; or a draw, with dispatches since
 /// the last wait). `careful`: before indirect dispatches too, with
 /// dispatches since the last wait. `compute`: the pipelines that are compute
-/// ones. The tables go to `jobs` (the contents of [`BATCH_JOBS`]).
+/// ones. The tables go to `jobs` (the contents of [`BATCH_JOBS`]). Passes
+/// that are batches already stay, as dispatches of the title's do.
 pub fn batch_clamps(
     cmds: Vec<Cmd>,
     psos: &HashSet<u32>,
@@ -371,11 +400,11 @@ pub fn batch_clamps(
     use crate::indirect::batch::{JOBS, SLOT, SOURCES, TIMES, job};
     const DISPATCH: u32 = 2;
     let mut done = Batched::default();
-    let scratches: HashSet<u32> = {
-        let mut next = 0;
-        let found = find_clamps(&cmds, psos, &mut next);
-        found.iter().map(|c| c.scratch).collect()
-    };
+    let (found, left) = find_clamps(&cmds, psos, &mut 0);
+    done.left = left;
+    // The pipelines of the clamps found: not the one of batches.
+    let psos: HashSet<u32> = found.iter().map(|c| c.pso).collect();
+    let scratches: HashSet<u32> = found.iter().map(|c| c.scratch).collect();
     if scratches.is_empty() {
         return (cmds, done);
     }
@@ -616,6 +645,45 @@ mod tests {
     fn barriers(all: &[Barrier]) -> Cmd {
         Cmd::Barriers { all: all.to_vec() }
     }
+    fn view(kind: u8, param: u32, res: u32, offset: u64) -> Cmd {
+        Cmd::RootView {
+            graphics: false,
+            kind,
+            param,
+            va: Va::At { res, offset },
+        }
+    }
+    /// A clamp batch into `scratch` as the host records it
+    /// (`crate::indirect::batch::record`), by pipeline 19.
+    fn batched(scratch: u32) -> Vec<Cmd> {
+        vec![
+            barriers(&[uav(0), moved(scratch, 0, 8)]),
+            Cmd::RootSignature {
+                graphics: false,
+                root: 18,
+            },
+            pso(19),
+            view(slot::SRV, 0, 70, 0),
+            view(slot::SRV, 1, 71, 0),
+            view(slot::SRV, 2, 72, 0),
+            view(slot::SRV, 3, 73, 0),
+            view(slot::SRV, 4, 80, 5120),
+            view(slot::UAV, 5, scratch, 0),
+            view(slot::UAV, 6, 6, 0),
+            Cmd::Dispatch { groups: [4, 1, 1] },
+            barriers(&[moved(scratch, 8, 0x200)]),
+        ]
+    }
+    fn reads(args: u32, at: u64) -> Cmd {
+        Cmd::Indirect {
+            signature: 1,
+            most: 1,
+            args,
+            at,
+            count: 0,
+            count_at: 0,
+        }
+    }
 
     #[test]
     fn pipelines_are_skipped() {
@@ -712,6 +780,7 @@ mod tests {
     fn clamp_copy_waits_for_the_end_of_a_split_transition() {
         let clamp = Clamp {
             at: 0,
+            pso: 9,
             scratch: 7,
             bytes: 16,
             result: 256,
@@ -796,7 +865,8 @@ mod tests {
         list.extend(clamp(5, 12, 100));
         list.extend([pso(1), run(5, 24), barriers(&[moved(5, 0x200, 0)])]);
         let mut next = 0;
-        let found = find_clamps(&list, &HashSet::from([9]), &mut next);
+        let (found, batches) = find_clamps(&list, &HashSet::from([9]), &mut next);
+        assert_eq!(batches, 0);
         assert_eq!(
             found
                 .iter()
@@ -843,6 +913,85 @@ mod tests {
             runs,
             [(RESULTS, 12), (RESULTS, 0), (6, 0), (RESULTS, 256 + 24)]
         );
+    }
+
+    #[test]
+    fn batches_are_not_clamps() {
+        // A clamp as the host records it, by pipeline 9 into buffer 5: both
+        // pipelines have the clamp's name.
+        let clamp = vec![
+            barriers(&[uav(0), moved(5, 0, 8)]),
+            Cmd::RootSignature {
+                graphics: false,
+                root: 8,
+            },
+            pso(9),
+            Cmd::Constants {
+                graphics: false,
+                param: 0,
+                offset: 0,
+                values: vec![10, 12, 2, 0, 0, 0],
+            },
+            view(slot::SRV, 1, 70, 0),
+            view(slot::SRV, 2, 70, 0),
+            view(slot::UAV, 3, 5, 0),
+            view(slot::UAV, 4, 6, 0),
+            go(),
+            barriers(&[uav(0), moved(5, 8, 0x200)]),
+        ];
+        let batch = batched(47);
+        let psos = HashSet::from([9, 19]);
+        let one = [clamp, vec![pso(1), reads(5, 0), reads(5, 12)]].concat();
+        let other = [batch.clone(), vec![pso(1), reads(47, 0), reads(47, 32)]].concat();
+        // In either order: what one pass set is not the next one's.
+        for list in [[one.clone(), other.clone()], [other, one]] {
+            let list = list.concat();
+            let at = list.iter().position(|c| *c == go()).unwrap();
+            let mut next = 0;
+            let (found, batches) = find_clamps(&list, &psos, &mut next);
+            let expected = Clamp {
+                at,
+                pso: 9,
+                scratch: 5,
+                bytes: 24,
+                result: 0,
+            };
+            assert_eq!((found.as_slice(), batches, next), (&[expected][..], 1, 256));
+            // The batch stays whole, and what reads its records.
+            let whole = |out: &[Cmd]| {
+                out.windows(batch.len()).filter(|w| *w == batch).count() == 1
+                    && out.contains(&reads(47, 32))
+                    && out.contains(&reads(47, 0))
+            };
+            let kept = keep_clamped(list.clone(), &found).unwrap();
+            assert_eq!(kept.len(), list.len() + 3);
+            assert!(whole(&kept));
+            let skipped = skip_clamps(list, &found);
+            assert!(whole(&skipped) && !skipped.contains(&go()));
+            assert!(skipped.contains(&reads(RESULTS, 0)) && skipped.contains(&reads(RESULTS, 12)));
+        }
+    }
+
+    #[test]
+    fn a_list_of_batches_has_no_clamps() {
+        let mut list = batched(47);
+        list.extend([pso(1), reads(47, 0), reads(47, 32)]);
+        list.extend(batched(48));
+        list.extend([pso(1), reads(48, 0)]);
+        let psos = HashSet::from([9, 19]);
+        let mut next = 0;
+        let (found, batches) = find_clamps(&list, &psos, &mut next);
+        assert_eq!((found.len(), batches, next), (0, 2, 0));
+        assert_eq!(keep_clamped(list.clone(), &found).unwrap(), list);
+        assert_eq!(skip_clamps(list.clone(), &found), list);
+        let (mut jobs, compute) = (Vec::new(), HashSet::from([1]));
+        let (out, done) = batch_clamps(list.clone(), &psos, &compute, 99, false, &mut jobs);
+        let left = Batched {
+            left: 2,
+            ..Batched::default()
+        };
+        assert_eq!((out, done), (list, left));
+        assert!(jobs.is_empty());
     }
 
     #[test]
@@ -950,5 +1099,19 @@ mod tests {
         let plain = vec![pso(1), go(), barriers(&[uav(0)])];
         let (out, done) = batch_clamps(plain.clone(), &clamps, &compute, 99, false, &mut Vec::new());
         assert_eq!((out, done), (plain, Batched::default()));
+        // A pass that is a batch already is not batched again: it stays,
+        // with what reads its records, and the clamp after it gets its own.
+        let before = [batched(47), vec![pso(2), reads(47, 32)]].concat();
+        let mut list = before.clone();
+        list.extend(clamp(10, 128, 1, 70));
+        list.extend([pso(2), run(0)]);
+        let clamps = HashSet::from([9, 19]);
+        let (out, done) = batch_clamps(list, &clamps, &compute, 99, false, &mut Vec::new());
+        assert_eq!(
+            (done.clamps, done.batches, done.jobs, done.left),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(out[..before.len()], before);
+        assert!(!out.contains(&pso(9)) && out.contains(&reads(99, 0)));
     }
 }
