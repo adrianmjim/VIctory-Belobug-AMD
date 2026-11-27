@@ -3251,7 +3251,13 @@ impl Player {
         let Some(bytes) = self.contents(p.res)? else {
             return Ok(None);
         };
-        let Some(rgb) = gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes) else {
+        self.shown_of(&p, &bytes)
+    }
+
+    /// The picture these bytes of the presented texture are, against the
+    /// recorded one; none of a format that is not shown.
+    fn shown_of(&self, p: &wire::Present, bytes: &[u8]) -> Result<Option<Shown>> {
+        let Some(rgb) = gpu::rgb(p.width, p.height, p.pitch, p.format, bytes) else {
             return Ok(None);
         };
         let mut recorded = vec![0; bytes.len()];
@@ -3263,7 +3269,7 @@ impl Player {
         let was = gpu::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
         Ok(Some(Shown {
             db: gpu::psnr(&rgb, &was),
-            same: rows_equal(&p, &bytes, &recorded),
+            same: rows_equal(p, bytes, &recorded),
             hash: blake3::hash(&rgb).to_hex().to_string(),
             recorded: blake3::hash(&was).to_hex().to_string(),
             rgb,
@@ -3287,13 +3293,12 @@ impl Player {
                         .push("the presented texture is not there".into());
                     return Ok(());
                 };
-                if gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes).is_none() {
+                // Of the bytes just read: one reading of the card, and the
+                // picture saved is the one that was looked at.
+                let Some(shown) = self.shown_of(&p, &bytes)? else {
                     report
                         .notes
                         .push("the presented format is not shown".into());
-                    return Ok(());
-                }
-                let Some(shown) = self.picture_now()? else {
                     return Ok(());
                 };
                 shown
