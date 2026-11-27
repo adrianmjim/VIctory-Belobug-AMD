@@ -404,14 +404,26 @@ fn committed(
             ..Default::default()
         },
     };
+    // As the host makes its textures and its buffers: not resident, and made
+    // so before anything uses them. The flag is in the capture, and a replay
+    // makes them again without it.
+    let flags = match place {
+        In::Back => D3D12_HEAP_FLAG_NONE,
+        _ => D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
+    };
     let mut made: Option<ID3D12Resource> = None;
     let mut data = std::ptr::null_mut();
     // SAFETY: plain creation and mapping.
     unsafe {
         device
-            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut made)
+            .CreateCommittedResource(&heap, flags, desc, state, None, &mut made)
             .unwrap();
         let made = made.unwrap();
+        if place != In::Back {
+            device
+                .MakeResident(&[Some(made.cast::<ID3D12Pageable>().unwrap())])
+                .unwrap();
+        }
         if place != In::Card {
             made.Map(0, None, Some(&mut data)).unwrap();
         }
