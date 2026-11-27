@@ -605,6 +605,12 @@ pub fn batch_clamps(
                     (written, dirty) = (true, true);
                 }
             }
+            // An indirect dispatch with arguments none of these clamps gave
+            // (a recorded batch's): its shader writes as any dispatch's.
+            Cmd::Indirect { .. } if compute.contains(&bound) => {
+                (written, dirty) = (true, true);
+                out.push(c);
+            }
             Cmd::Dispatch { .. } => {
                 (written, dirty) = (true, true);
                 out.push(c);
@@ -1113,5 +1119,17 @@ mod tests {
         );
         assert_eq!(out[..before.len()], before);
         assert!(!out.contains(&pso(9)) && out.contains(&reads(99, 0)));
+        // An indirect dispatch that reads the recorded batch's records
+        // writes as a dispatch does: after it and a wait of the title's, a
+        // clamp gets a batch of its own, not a place in the one before.
+        let mut list = before.clone();
+        list.extend(clamp(10, 128, 1, 70));
+        list.extend([pso(2), run(0)]);
+        list.extend([pso(1), reads(47, 64), barriers(&[uav(0)])]);
+        list.extend(clamp(10, 256, 1, 70));
+        list.extend([pso(2), run(0)]);
+        let (out, done) = batch_clamps(list, &clamps, &compute, 99, false, &mut Vec::new());
+        assert_eq!((done.clamps, done.batches, done.left), (2, 2, 1));
+        assert!(out.contains(&reads(47, 64)));
     }
 }
